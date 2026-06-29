@@ -121,8 +121,7 @@ def train_qlora(
     """
     try:
         from unsloth import FastLanguageModel
-        from trl import SFTTrainer
-        from transformers import TrainingArguments
+        from trl import SFTConfig, SFTTrainer
     except ImportError as error:
         raise ImportError(
             "Cần cài unsloth và trl: pip install unsloth trl transformers"
@@ -166,7 +165,16 @@ def train_qlora(
     checkpoint_dir = output_dir / f"checkpoints_{model_key}_qlora"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    training_arguments = TrainingArguments(
+    effective_batch = batch_size * gradient_accumulation_steps
+    steps_per_epoch = max(
+        1, (len(formatted_dataset) + effective_batch - 1) // effective_batch
+    )
+    total_steps = steps_per_epoch * num_epochs
+    warmup_steps = max(1, int(total_steps * 0.05))
+
+    # Dùng SFTConfig (không dùng TrainingArguments) để tránh lỗi pickle
+    # khi Unsloth lưu checkpoint: "Can't pickle SFTConfig: not the same object".
+    training_arguments = SFTConfig(
         output_dir=str(checkpoint_dir),
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
@@ -176,10 +184,12 @@ def train_qlora(
         logging_steps=10,
         save_strategy="epoch",
         optim="adamw_8bit",
-        warmup_ratio=0.05,
+        warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
         report_to="none",
         seed=42,
+        max_length=max_seq_length,
+        dataset_text_field="text",
     )
 
     print("[4/5] Bắt đầu huấn luyện QLoRA...")
@@ -187,8 +197,6 @@ def train_qlora(
         model=model,
         tokenizer=tokenizer,
         train_dataset=formatted_dataset,
-        dataset_text_field="text",
-        max_seq_length=max_seq_length,
         args=training_arguments,
     )
     trainer.train()
