@@ -55,15 +55,17 @@ class Schema:
 
     def _map(self, schema: Dict[str, List[str]]) -> Dict[str, str]:
         id_map: Dict[str, str] = {"*": "__all__"}
-        identifier = 1
         for table_name, columns in schema.items():
+            normalized_table = normalize_identifier(table_name)
             for column_name in columns:
                 key = f"{table_name.lower()}.{column_name.lower()}"
+                normalized_key = f"{normalized_table}.{normalize_identifier(column_name)}"
                 id_map[key] = f"__{key}__"
-                identifier += 1
-        for table_name in schema:
+                if normalized_key not in id_map:
+                    id_map[normalized_key] = f"__{key}__"
+            if normalized_table not in id_map:
+                id_map[normalized_table] = f"__{table_name.lower()}__"
             id_map[table_name.lower()] = f"__{table_name.lower()}__"
-            identifier += 1
         return id_map
 
 
@@ -124,6 +126,18 @@ def normalize_sql_string(sql: str) -> str:
     return text
 
 
+def normalize_identifier(name: str) -> str:
+    """Chuẩn hóa tên bảng/cột để khớp giữa dấu gạch dưới, khoảng trắng và quote."""
+    if not isinstance(name, str):
+        return ""
+    text = name.strip().lower()
+    if len(text) >= 2 and ((text[0] == text[-1] == '"') or (text[0] == text[-1] == "'")):
+        text = text[1:-1].strip()
+    text = text.replace("_", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def tokenize_vitext2sql(string: Union[str, List[str]]) -> List[str]:
     """
     Tokenize câu SQL theo định dạng ViText2SQL.
@@ -134,58 +148,57 @@ def tokenize_vitext2sql(string: Union[str, List[str]]) -> List[str]:
         return [token.lower() if token not in ('"', "'") else token for token in string]
 
     text = normalize_sql_string(string)
-
-    # Giữ nguyên giá trị chuỗi trong dấu nháy kép
-    values: Dict[str, str] = {}
-    quote_indices = [index for index, char in enumerate(text) if char == '"']
-    if len(quote_indices) % 2 != 0:
-        quote_indices = quote_indices[:-1]
-    for index in range(len(quote_indices) - 1, 0, -2):
-        start = quote_indices[index - 1]
-        end = quote_indices[index]
-        value = text[start : end + 1]
-        placeholder = f"__val_{start}_{end}__"
-        text = text[:start] + placeholder + text[end + 1 :]
-        values[placeholder] = value
-
-    tokens = text.split()
-
-    # Gộp toán tử hai ký tự: >=, <=, !=
-    merged: List[str] = []
-    index = 0
-    while index < len(tokens):
-        if index + 1 < len(tokens) and tokens[index] in ("!", ">", "<") and tokens[index + 1] == "=":
-            merged.append(tokens[index] + "=")
-            index += 2
-        else:
-            merged.append(tokens[index])
-            index += 1
-
-    for token_index, token in enumerate(merged):
-        if token in values:
-            merged[token_index] = values[token]
-
-    return merged
+    token_pattern = r'"[^"]*"(?:\.[^\s,()=<>!]+)*|!=|>=|<=|[=<>(),]|[^\s,()=<>!]+'
+    tokens = re.findall(token_pattern, text)
+    return [token.lower() for token in tokens if token.strip()]
 
 
-def scan_alias(tokens: List[str]) -> Dict[str, str]:
-    """Quét alias sau từ khóa 'as' và xây dựng bản đồ alias -> tên bảng."""
-    alias_map: Dict[str, str] = {}
-    for index, token in enumerate(tokens):
-        if token == "as" and index >= 1 and index + 1 < len(tokens):
-            alias_map[tokens[index + 1]] = tokens[index - 1]
-    return alias_map
+def _find_table_name(
+    tokens: List[str], start_index: int, schema: Dict[str, List[str]]
+) -> Tuple[str, int]:
+    """Tìm tên bảng dài nhất hợp lệ trong schema, bắt đầu tại start_index."""
+    normalized_schema = {
+        normalize_identifier(table_name): table_name for table_name in schema
+    }
+    best_match: Optional[str] = None
+    best_end = start_index
+    end_index = start_index
+
+    while end_index < len(tokens):
+        token = tokens[end_index]
+        if token in CLAUSE_KEYWORDS or token in JOIN_KEYWORDS or token in (")", ";", ","):
+            break
+        candidate = normalize_identifier(" ".join(tokens[start_index : end_index + 1]))
+        if candidate in normalized_schema:
+            best_match = normalized_schema[candidate]
+            best_end = end_index + 1
+        end_index += 1
+
+    if best_match is not None:
+        return best_match, best_end
+
+    table_parts: List[str] = [tokens[start_index]]
+    end_index = start_index + 1
+    while (
+        end_index < len(tokens)
+        and tokens[end_index] != "as"
+        and tokens[end_index] not in JOIN_KEYWORDS
+        and tokens[end_index] not in CLAUSE_KEYWORDS
+        and tokens[end_index] not in (")", ";", ",")
+    ):
+        table_parts.append(tokens[end_index])
+        end_index += 1
+    return normalize_identifier(" ".join(table_parts)), end_index
 
 
 def get_tables_with_alias(
     schema: Dict[str, List[str]], tokens: List[str]
 ) -> Dict[str, str]:
-    """Kết hợp alias từ câu SQL với tên bảng trong schema."""
-    tables = scan_alias(tokens)
-    for table_name in schema:
-        if table_name not in tables:
-            tables[table_name] = table_name
-    return tables
+    """Khởi tạo bản đồ tên bảng chuẩn hóa -> tên bảng gốc."""
+    return {
+        normalize_identifier(table_name): table_name
+        for table_name in schema
+    }
 
 
 def _is_stop_token(token: str) -> bool:
@@ -199,14 +212,18 @@ def _resolve_column_key(
     schema: Schema,
 ) -> str:
     """Ghép alias/bảng với tên cột (có thể nhiều token) thành khóa schema."""
-    table = tables_with_alias.get(alias_or_table, alias_or_table)
-    column = " ".join(column_parts)
-    key = f"{table.lower()}.{column.lower()}"
+    table_key = normalize_identifier(alias_or_table)
+    table = tables_with_alias.get(table_key, alias_or_table)
+    column = normalize_identifier(" ".join(column_parts))
+    key = f"{table.lower()}.{column}"
     if key in schema.idMap:
         return schema.idMap[key]
+    normalized_key = f"{normalize_identifier(table)}.{column}"
+    if normalized_key in schema.idMap:
+        return schema.idMap[normalized_key]
     # Thử khớp mờ: cột có thể thiếu prefix bảng
     for candidate_key in schema.idMap:
-        if candidate_key.endswith(f".{column.lower()}"):
+        if candidate_key.endswith(f".{column}"):
             return schema.idMap[candidate_key]
     raise ValueError(f"Không tìm thấy cột trong schema: {key}")
 
@@ -235,16 +252,18 @@ def parse_col(
 
     if default_tables:
         for alias in default_tables:
-            table = tables_with_alias[alias]
+            table = tables_with_alias.get(normalize_identifier(alias), alias)
             column_parts = [token]
             index = start_index + 1
             while index < len(tokens) and not _is_stop_token(tokens[index]):
                 column_parts.append(tokens[index])
                 index += 1
             column_name = " ".join(column_parts)
-            if column_name in schema.schema.get(table, []):
-                key = f"{table}.{column_name}"
-                return index, schema.idMap[key]
+            normalized_column = normalize_identifier(column_name)
+            for column in schema.schema.get(table, []):
+                if normalize_identifier(column) == normalized_column:
+                    key = f"{table}.{column}"
+                    return index, schema.idMap[key]
 
     raise ValueError(f"Lỗi parse cột: {token}")
 
@@ -329,22 +348,32 @@ def parse_table_unit(
     tables_with_alias: Dict[str, str],
     schema: Schema,
 ) -> Tuple[int, str, str]:
-    """Phân tích tên bảng (có thể nhiều token trước 'as')."""
+    """Phân tích tên bảng (có thể nhiều token trước alias)."""
     index = start_index
-    table_parts = [tokens[index]]
-    index += 1
-    while index < len(tokens) and tokens[index] != "as" and tokens[index] not in JOIN_KEYWORDS:
-        if tokens[index] in CLAUSE_KEYWORDS:
-            break
-        table_parts.append(tokens[index])
+    table_name, index = _find_table_name(tokens, index, schema.schema)
+    if table_name not in schema.idMap:
+        raise ValueError(f"Không tìm thấy bảng trong schema: {table_name}")
+
+    normalized_table = normalize_identifier(table_name)
+    if normalized_table not in tables_with_alias:
+        tables_with_alias[normalized_table] = table_name
+
+    alias: Optional[str] = None
+    if index < len(tokens) and tokens[index] == "as":
+        if index + 1 < len(tokens):
+            alias = tokens[index + 1]
+        index += 2
+    elif (
+        index < len(tokens)
+        and tokens[index] not in CLAUSE_KEYWORDS
+        and tokens[index] not in JOIN_KEYWORDS
+        and tokens[index] not in (")", ";", ",")
+    ):
+        alias = tokens[index]
         index += 1
 
-    table_name = " ".join(table_parts).lower()
-    if table_name not in tables_with_alias:
-        tables_with_alias[table_name] = table_name
-
-    if index < len(tokens) and tokens[index] == "as":
-        index += 2  # bỏ qua 'as' và alias
+    if alias:
+        tables_with_alias[normalize_identifier(alias)] = table_name
 
     return index, schema.idMap[table_name], table_name
 
@@ -367,6 +396,12 @@ def parse_value(
     elif '"' in tokens[index]:
         value = tokens[index]
         index += 1
+    elif tokens[index] == "null":
+        value = "null"
+        index += 1
+    elif tokens[index] == "not" and index + 1 < length and tokens[index + 1] == "null":
+        value = "not null"
+        index += 2
     else:
         try:
             value = float(tokens[index])
@@ -469,6 +504,10 @@ def parse_select(
             tokens, index, tables_with_alias, schema, default_tables
         )
         val_units.append((agg_id, val_unit))
+        if index < len(tokens) and tokens[index] == "as":
+            index += 1
+            if index < len(tokens) and tokens[index] not in CLAUSE_KEYWORDS + (",",):
+                index += 1
         if index < len(tokens) and tokens[index] == ",":
             index += 1
 

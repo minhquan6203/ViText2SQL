@@ -17,8 +17,8 @@ from src.spider_eval.process_sql import (
     get_sql,
 )
 
-DISABLE_VALUE = True
-DISABLE_DISTINCT = True
+DISABLE_VALUE = False
+DISABLE_DISTINCT = False
 
 WHERE_OPS = (
     "not", "between", "=", ">", "<", ">=", "<=", "!=", "in", "like", "is", "exists",
@@ -35,14 +35,22 @@ def get_scores(count: int, pred_total: int, label_total: int) -> Tuple[int, int,
     return 0, 0, 0
 
 
-def eval_sel(pred: Dict, label: Dict) -> Tuple[int, int, int, int]:
-    pred_sel = pred["select"][1]
-    label_sel = label["select"][1]
+def eval_sel(pred: Dict, label: Dict) -> Tuple[int, int, int, int, int, int]:
+    pred_distinct, pred_sel = pred["select"]
+    label_distinct, label_sel = label["select"]
+    pred_sel = list(pred_sel)
+    label_sel = list(label_sel)
     label_without_agg = [unit[1] for unit in label_sel]
-    pred_total = len(pred_sel)
-    label_total = len(label_sel)
+
+    pred_total = len(pred_sel) + (1 if pred_distinct else 0)
+    label_total = len(label_sel) + (1 if label_distinct else 0)
+    pred_no_agg_total = len(pred_sel)
+    label_no_agg_total = len(label_sel)
     count = 0
     count_without_agg = 0
+
+    if pred_distinct and label_distinct:
+        count += 1
 
     for unit in pred_sel:
         if unit in label_sel:
@@ -52,7 +60,14 @@ def eval_sel(pred: Dict, label: Dict) -> Tuple[int, int, int, int]:
             count_without_agg += 1
             label_without_agg.remove(unit[1])
 
-    return label_total, pred_total, count, count_without_agg
+    return (
+        label_total,
+        pred_total,
+        count,
+        count_without_agg,
+        label_no_agg_total,
+        pred_no_agg_total,
+    )
 
 
 def eval_where(pred: Dict, label: Dict) -> Tuple[int, int, int, int]:
@@ -171,6 +186,8 @@ def get_keywords(sql: Dict) -> set:
         result.add("union")
     if sql["intersect"] is not None:
         result.add("intersect")
+    if sql["select"] and sql["select"][0]:
+        result.add("distinct")
 
     ao = sql["from"]["conds"][1::2] + sql["where"][1::2] + sql["having"][1::2]
     if any(token == "or" for token in ao):
@@ -401,8 +418,10 @@ class Evaluator:
         partial_scores = self.eval_partial_match(pred, label)
         self.partial_scores = partial_scores
 
-        for _, score in partial_scores.items():
-            if score["f1"] != 1:
+        required_components = ["select", "where", "group", "order", "and/or", "IUEN"]
+        for component in required_components:
+            score = partial_scores.get(component)
+            if not score or score["f1"] != 1:
                 return 0
 
         if len(label["from"]["table_units"]) > 0:
@@ -414,16 +433,23 @@ class Evaluator:
     def eval_partial_match(self, pred: Dict, label: Dict) -> Dict[str, Dict[str, Union[int, float]]]:
         result: Dict[str, Dict[str, Union[int, float]]] = {}
 
-        label_total, pred_total, count, count_without_agg = eval_sel(pred, label)
+        (
+            label_total,
+            pred_total,
+            count,
+            count_without_agg,
+            label_no_agg_total,
+            pred_no_agg_total,
+        ) = eval_sel(pred, label)
         accuracy, recall, f1 = get_scores(count, pred_total, label_total)
         result["select"] = {
             "acc": accuracy, "rec": recall, "f1": f1,
             "label_total": label_total, "pred_total": pred_total,
         }
-        accuracy, recall, f1 = get_scores(count_without_agg, pred_total, label_total)
+        accuracy, recall, f1 = get_scores(count_without_agg, pred_no_agg_total, label_no_agg_total)
         result["select(no AGG)"] = {
             "acc": accuracy, "rec": recall, "f1": f1,
-            "label_total": label_total, "pred_total": pred_total,
+            "label_total": label_no_agg_total, "pred_total": pred_no_agg_total,
         }
 
         label_total, pred_total, count, count_without_agg = eval_where(pred, label)
