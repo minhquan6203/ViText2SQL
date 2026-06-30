@@ -97,6 +97,8 @@ class Text2SQLInferenceEngine:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        if getattr(self.tokenizer, "padding_side", None) != "left":
+            self.tokenizer.padding_side = "left"
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
