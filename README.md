@@ -186,6 +186,18 @@ python -m src.inference \
   --split test
 ```
 
+Batch inference mới: thêm `--batch_size` để xử lý nhiều prompt cùng lúc.
+
+```bash
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode zero_shot \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --batch_size 4
+```
+
 Kết quả: `outputs/predictions_{model}_{mode}_{split}.json`
 
 ### 2. Fine-tune QLoRA (Unsloth)

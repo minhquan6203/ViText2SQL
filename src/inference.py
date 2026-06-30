@@ -156,6 +156,67 @@ class Text2SQLInferenceEngine:
         )
         return normalize_predicted_sql(generated)
 
+    def generate_sql_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 512,
+        temperature: float = 0.1,
+        top_p: float = 0.95,
+    ) -> List[str]:
+        """Sinh nhiều SQL cùng lúc từ một danh sách prompt.
+
+        Lưu ý: với `use_unsloth` sẽ fallback về vòng lặp đơn.
+        """
+        if self.use_unsloth:
+            return [self.generate_sql(p, max_new_tokens, temperature, top_p) for p in prompts]
+
+        # Áp dụng template chat nếu tokenizer hỗ trợ
+        input_texts: List[str] = []
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            for prompt in prompts:
+                try:
+                    input_text = self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                except Exception:
+                    input_text = prompt
+                input_texts.append(input_text)
+        else:
+            input_texts = prompts
+
+        inputs = self.tokenizer(
+            input_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length - max_new_tokens,
+        )
+
+        # Lưu độ dài input thực tế để tách phần sinh ra sau này
+        input_lengths = inputs["attention_mask"].sum(dim=1)
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=temperature > 0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        results: List[str] = []
+        for i, input_len in enumerate(input_lengths):
+            gen_tokens = outputs[i, input_len:]
+            text = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            results.append(normalize_predicted_sql(text))
+
+        return results
+
 
 def run_inference(
     split: str,
@@ -169,6 +230,7 @@ def run_inference(
     load_in_4bit: bool = True,
     use_unsloth: bool = False,
     seed: int = 42,
+    batch_size: int = 1,
 ) -> List[Dict[str, Any]]:
     """
     Chạy suy luận trên tập dev hoặc test.
@@ -197,55 +259,74 @@ def run_inference(
 
     predictions: List[Dict[str, Any]] = []
 
-    for item in tqdm(eval_data, desc=f"{mode} - {model_key} - {split}"):
-        db_id = item["db_id"]
-        question = item["question"]
-        gold_sql = item["query"]
+    # Xử lý theo batch
+    for start in tqdm(range(0, len(eval_data), batch_size), desc=f"{mode} - {model_key} - {split}"):
+        batch_items = eval_data[start : start + batch_size]
+        prompts: List[str] = []
+        per_item_meta: List[Dict[str, Any]] = []
 
-        table_entry = tables_index[db_id]
+        for item in batch_items:
+            db_id = item["db_id"]
+            question = item["question"]
+            gold_sql = item["query"]
 
-        few_shot_examples = None
-        if mode == "few_shot":
-            if example_strategy == "bm25":
-                few_shot_examples = select_few_shot_examples_bm25(
-                    target_question=question,
-                    candidate_pool=train_data,
-                    num_examples=num_shots,
-                    target_db_id=db_id,
-                )
-            else:
-                few_shot_examples = select_few_shot_examples_random(
-                    candidate_pool=train_data,
-                    num_examples=num_shots,
-                    target_db_id=db_id,
-                    exclude_question=question,
-                    seed=seed,
-                )
+            table_entry = tables_index[db_id]
 
-        reference_sql = few_shot_examples[0]["sql"] if few_shot_examples else None
-        schema_text = schema_linking(
-            table_entry=table_entry,
-            question=question,
-            reference_sql=reference_sql,
-        )
+            few_shot_examples = None
+            if mode == "few_shot":
+                if example_strategy == "bm25":
+                    few_shot_examples = select_few_shot_examples_bm25(
+                        target_question=question,
+                        candidate_pool=train_data,
+                        num_examples=num_shots,
+                        target_db_id=db_id,
+                    )
+                else:
+                    few_shot_examples = select_few_shot_examples_random(
+                        candidate_pool=train_data,
+                        num_examples=num_shots,
+                        target_db_id=db_id,
+                        exclude_question=question,
+                        seed=seed,
+                    )
 
-        prompt = build_text2sql_prompt(
-            question=question,
-            schema_content=schema_text,
-            few_shot_examples=few_shot_examples,
-        )
+            reference_sql = few_shot_examples[0]["sql"] if few_shot_examples else None
+            schema_text = schema_linking(
+                table_entry=table_entry,
+                question=question,
+                reference_sql=reference_sql,
+            )
 
-        predicted_sql = engine.generate_sql(prompt)
+            prompt = build_text2sql_prompt(
+                question=question,
+                schema_content=schema_text,
+                few_shot_examples=few_shot_examples,
+            )
 
-        predictions.append({
-            "db_id": db_id,
-            "question": question,
-            "gold_sql": gold_sql,
-            "predict_sql": predicted_sql,
-            "gold_query_toks": item.get("query_toks"),
-            "mode": mode,
-            "model": model_key,
-        })
+            prompts.append(prompt)
+            per_item_meta.append({
+                "db_id": db_id,
+                "question": question,
+                "gold_sql": gold_sql,
+                "gold_query_toks": item.get("query_toks"),
+            })
+
+        # Sinh theo batch (engine sẽ fallback sang vòng lặp nếu không hỗ trợ)
+        if len(prompts) == 1:
+            predicted_sqls = [engine.generate_sql(prompts[0])]
+        else:
+            predicted_sqls = engine.generate_sql_batch(prompts)
+
+        for meta, predicted_sql in zip(per_item_meta, predicted_sqls):
+            predictions.append({
+                "db_id": meta["db_id"],
+                "question": meta["question"],
+                "gold_sql": meta["gold_sql"],
+                "predict_sql": predicted_sql,
+                "gold_query_toks": meta.get("gold_query_toks"),
+                "mode": mode,
+                "model": model_key,
+            })
 
     save_json(predictions, output_path)
     print(f"Đã lưu {len(predictions)} dự đoán tại: {output_path}")
@@ -309,6 +390,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Giới hạn số mẫu (debug)",
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Kích thước batch để suy luận (mặc định 1 = không batch).",
+    )
+    parser.add_argument(
         "--no_4bit",
         action="store_true",
         help="Tắt quantization 4-bit",
@@ -339,6 +426,7 @@ def main() -> None:
         load_in_4bit=not args.no_4bit,
         use_unsloth=args.use_unsloth,
         seed=args.seed,
+        batch_size=args.batch_size,
     )
 
 
