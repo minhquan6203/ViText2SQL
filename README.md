@@ -221,6 +221,8 @@ Sau train tự động sinh `predictions_{model}_finetuned_test.json`.
 
 ### 3. Đánh giá EM & F1
 
+> Lưu ý: `src.inference` chỉ tạo file dự đoán, không tính điểm. Để tính Exact Match và Component F1, chạy `src.evaluate`.
+
 ```bash
 python -m src.evaluate \
   --predictions outputs/predictions_qwen2.5-coder-1.5b_zero_shot_test.json \
@@ -228,6 +230,12 @@ python -m src.evaluate \
   --output_metrics outputs/metrics_zero_shot.json \
   --verbose
 ```
+
+Trong đó:
+- `--predictions`: file JSON do inference sinh ra.
+- `--tables`: file `tables.json` của biến thể dữ liệu dùng cho schema.
+- `--output_metrics`: (tuỳ chọn) lưu kết quả EM/F1 ra JSON.
+- `--verbose`: in chi tiết các câu hỏi dự đoán sai.
 
 Xuất định dạng Spider (tab-separated):
 
@@ -237,6 +245,8 @@ python -m src.evaluate \
   --tables data/word-level/tables.json \
   --export_spider_format outputs/spider_format
 ```
+
+Sau khi chạy, bạn sẽ nhận được EM/F1 và có thể dùng file `predict.sql` / `gold.sql` để phân tích thêm.
 
 ---
 

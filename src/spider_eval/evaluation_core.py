@@ -515,15 +515,26 @@ def evaluate_em_f1(
     key_map = foreign_key_map or {}
     evaluator = Evaluator()
 
+    gold_failed = False
+    pred_failed = False
     try:
         gold_parsed = get_sql(schema, gold_tokens if gold_tokens else gold_sql)
     except Exception:
         gold_parsed = empty_sql()
+        gold_failed = True
 
     try:
         pred_parsed = get_sql(schema, predict_tokens if predict_tokens else predict_sql)
     except Exception:
         pred_parsed = empty_sql()
+        pred_failed = True
+
+    if (gold_failed or pred_failed) and (gold_sql.strip() or predict_sql.strip()):
+        return {
+            "exact_match": 0,
+            "partial_scores": {},
+            "average_component_f1": 0.0,
+        }
 
     gold_valid_cols = build_valid_col_units(gold_parsed["from"]["table_units"], schema)
     gold_parsed = rebuild_sql_val(gold_parsed)
