@@ -29,6 +29,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "max_seq_length": 4096,
         "chat_template": True,
     },
+    "qwen2.5-coder-7b": {
+        "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "max_seq_length": 4096,
+        "chat_template": True,
+    },
     "llama-3.2-3b": {
         "model_name": "meta-llama/Llama-3.2-3B-Instruct",
         "max_seq_length": 4096,

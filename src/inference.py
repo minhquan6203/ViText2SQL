@@ -343,7 +343,7 @@ def parse_arguments() -> argparse.Namespace:
         "--model",
         type=str,
         default="qwen2.5-coder-1.5b",
-        choices=["qwen2.5-coder-1.5b", "llama-3.2-3b", "gemma-2-2b"],
+        choices=["qwen2.5-coder-1.5b", "llama-3.2-3b", "gemma-2-2b", "qwen2.5-coder-7b"],
         help="Mô hình LLM phân khúc ~2B",
     )
     parser.add_argument(
