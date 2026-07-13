@@ -1,5 +1,5 @@
 """
-Client gọi API LLM cho Text-to-SQL (DeepSeek, Gemini, OpenAI-compatible).
+Client gọi API LLM cho Text-to-SQL (DeepSeek, Gemini, OpenAI).
 
 Dùng trong notebook hoặc script khi không cần chạy mô hình local.
 """
@@ -38,6 +38,11 @@ API_MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "provider": "gemini",
         "model_id": "gemini-1.5-flash",
         "description": "Google Gemini 1.5 Flash (nhanh, rẻ)",
+    },
+    "gpt-5.4": {
+        "provider": "openai",
+        "model_id": "gpt-5.4",
+        "description": "OpenAI GPT-5.4",
     },
 }
 
@@ -186,6 +191,61 @@ class GeminiClient(BaseAPIClient):
         return response.text or ""
 
 
+class OpenAIClient(BaseAPIClient):
+    """
+    Client OpenAI (GPT) qua Chat Completions API.
+
+    Cần biến môi trường OPENAI_API_KEY.
+    Lấy key: https://platform.openai.com/api-keys
+    """
+
+    def __init__(
+        self,
+        model_id: str = "gpt-5.4",
+        api_key: Optional[str] = None,
+        reasoning_effort: Optional[str] = "low",
+        **kwargs: Any,
+    ):
+        super().__init__(model_id=model_id, **kwargs)
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "Thiếu OPENAI_API_KEY. "
+                "Đặt trong môi trường hoặc truyền api_key=..."
+            )
+        # Mô hình reasoning (vd. gpt-5.4) có thể tiêu hết max_completion_tokens
+        # cho reasoning nội bộ và trả về nội dung rỗng nếu để mặc định.
+        # "low" đủ cho tác vụ Text-to-SQL một lượt, tránh lãng phí token/độ trễ.
+        self.reasoning_effort = reasoning_effort
+
+        try:
+            from openai import OpenAI
+        except ImportError as error:
+            raise ImportError("Cần cài openai: pip install openai") from error
+
+        self.client = OpenAI(api_key=self.api_key)
+
+    def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+        extra_args: Dict[str, Any] = {}
+        if self.reasoning_effort:
+            extra_args["reasoning_effort"] = self.reasoning_effort
+
+        # Các model reasoning (vd. gpt-5.4) chỉ chấp nhận temperature mặc định
+        # (=1) và trả lỗi 400 "unsupported_value" nếu truyền giá trị khác.
+        # Vì vậy KHÔNG gửi tham số temperature cho client này.
+        response = self.client.chat.completions.create(
+            model=self.model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            max_completion_tokens=self.max_tokens,
+            **extra_args,
+        )
+        return response.choices[0].message.content or ""
+
+
 def create_api_client(
     model_key: str,
     api_key: Optional[str] = None,
@@ -216,6 +276,13 @@ def create_api_client(
         )
     if provider == "gemini":
         return GeminiClient(
+            model_id=model_id,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    if provider == "openai":
+        return OpenAIClient(
             model_id=model_id,
             api_key=api_key,
             temperature=temperature,
