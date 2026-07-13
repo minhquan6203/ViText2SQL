@@ -1,0 +1,9 @@
+{
+  "exact_match": 0.37,
+  "select_f1": 0.58,
+  "where_f1": 0.46,
+  "group_f1": 0.64,
+  "order_f1": 0.66,
+  "average_component_f1": 0.585,
+  "total_samples": 100
+}
