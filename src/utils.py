@@ -5,14 +5,18 @@ Tiện ích dùng chung: tải dữ liệu, schema linking, và định dạng p
 from __future__ import annotations
 
 import json
-import os
 import random
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import sqlparse
-from rank_bm25 import BM25Okapi
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
 
 # Đường dẫn mặc định
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -267,55 +271,205 @@ def extract_sql_keywords(sql: str) -> set:
     return tokens
 
 
+VIETNAMESE_SCHEMA_SYNONYMS: Dict[str, List[str]] = {
+    "ten": ["name", "ten", "ho_ten"],
+    "ma": ["id", "code", "ma", "mã"],
+    "khach_hang": ["khach_hang", "customer", "khách_hàng", "nguoi_mua"],
+    "don_hang": ["don_hang", "order", "đơn_hàng", "hoa_don"],
+    "san_pham": ["san_pham", "product", "sản_phẩm", "mat_hang"],
+    "thanh_pho": ["thanh_pho", "city", "tp", "tỉnh_thành", "thành_phố"],
+    "dia_chi": ["dia_chi", "address", "location", "địa_chỉ"],
+    "ngay": ["ngay", "date", "time", "thoi_gian"],
+    "so_luong": ["so_luong", "count", "total", "quantity", "sum"],
+    "gia": ["gia", "price", "cost", "amount"],
+    "trang_thai": ["trang_thai", "status", "state", "tình_trạng"],
+    "nhan_vien": ["nhan_vien", "employee", "staff", "nhân_viên"],
+    "ban": ["ban", "store", "shop", "cua_hang"],
+}
+
+
+def normalize_schema_text(text: str) -> str:
+    """Chuẩn hóa văn bản tiếng Việt/SQL để so khớp schema tốt hơn."""
+    if not text:
+        return ""
+    text = text.lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("_", " ")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def tokenise_schema_name(name: str) -> List[str]:
+    """Tách tên schema thành token để so khớp tiếng Việt/SQL."""
+    normalized = normalize_schema_text(name)
+    return [token for token in normalized.split() if token]
+
+
+def expand_schema_tokens(tokens: List[str]) -> set:
+    """Mở rộng token theo từ đồng nghĩa đơn giản để tăng khả năng match."""
+    expanded: set = set()
+    for token in tokens:
+        expanded.add(token)
+        for key, values in VIETNAMESE_SCHEMA_SYNONYMS.items():
+            if token in values or token == key:
+                expanded.add(key)
+                expanded.update(values)
+    return expanded
+
+
+def compute_lexical_score(question: str, schema_name: str) -> float:
+    """Tính điểm khớp từ vựng giữa câu hỏi và tên schema."""
+    q_tokens = set(tokenise_schema_name(question))
+    s_tokens = set(tokenise_schema_name(schema_name))
+    if not q_tokens or not s_tokens:
+        return 0.0
+
+    q_expanded = expand_schema_tokens(list(q_tokens))
+    s_expanded = expand_schema_tokens(list(s_tokens))
+    overlap = q_expanded & s_expanded
+    if not overlap:
+        # hỗ trợ match partial token trong trường hợp không có overlap trực tiếp
+        q_list = list(q_expanded)
+        s_list = list(s_expanded)
+        for q_token in q_list:
+            for s_token in s_list:
+                if q_token in s_token or s_token in q_token:
+                    return 0.75
+        return 0.0
+
+    return min(1.0, len(overlap) / max(1, len(s_expanded)))
+
+
+def get_semantic_similarity_model():
+    """Trả về model embedding nếu đã cài sentence-transformers."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        return None
+
+    try:
+        return SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    except Exception:
+        return None
+
+
+def semantic_similarity(question: str, schema_name: str, model=None) -> float:
+    """Độ tương đồng ngữ nghĩa giữa câu hỏi và tên schema (không bắt buộc)."""
+    if model is None or np is None:
+        return 0.0
+    try:
+        q_embedding = model.encode(question, convert_to_numpy=True, normalize_embeddings=True)
+        s_embedding = model.encode(schema_name, convert_to_numpy=True, normalize_embeddings=True)
+        score = float(np.dot(q_embedding, s_embedding))
+        return max(0.0, min(1.0, score))
+    except Exception:
+        return 0.0
+
+
 def schema_linking(
     table_entry: Dict[str, Any],
     question: str,
     reference_sql: Optional[str] = None,
     max_tables: Optional[int] = None,
+    use_semantic_rerank: bool = False,
+    semantic_model: Any = None,
 ) -> str:
     """
-    Schema Linking: lọc schema, chỉ giữ bảng/cột liên quan đến câu hỏi.
+    Schema Linking nâng cấp: giữ schema liên quan với câu hỏi dựa trên lexical match,
+    từ đồng nghĩa tiếng Việt và (tuỳ chọn) semantic reranking.
 
     Chiến lược:
-    1. Khớp tên bảng/cột xuất hiện trong câu hỏi (tiếng Việt)
-    2. Nếu có reference_sql (few-shot), bổ sung bảng/cột từ SQL mẫu
-    3. Luôn giữ ít nhất một bảng nếu không khớp gì (tránh schema rỗng)
+    1. Khớp tên bảng/cột bằng normalized tokens và synonym tiếng Việt
+    2. Nếu có reference_sql, bổ sung bảng/cột xuất hiện trong SQL mẫu
+    3. (Tuỳ chọn) dùng embedding semantic rerank để lọc schema chính xác hơn
+    4. Luôn giữ tối thiểu một bảng nếu không match gì
     """
     table_names = table_entry["table_names"]
     column_names = table_entry["column_names"]
     column_types = table_entry.get("column_types", [])
 
-    question_lower = question.lower()
+    question_norm = normalize_schema_text(question)
+    question_tokens = set(tokenise_schema_name(question))
     sql_keywords: set = set()
     if reference_sql:
         sql_keywords = extract_sql_keywords(reference_sql)
 
-    relevant_table_indices: set = set()
+    table_scores: Dict[int, float] = {}
+    column_scores: Dict[Tuple[int, int], float] = {}
 
     for table_index, table_name in enumerate(table_names):
-        table_lower = table_name.lower()
-        if table_lower in question_lower or table_lower in sql_keywords:
-            relevant_table_indices.add(table_index)
-            continue
+        score = compute_lexical_score(question_norm, table_name)
+        if table_name.lower() in question_norm or table_name.lower() in {normalize_schema_text(k) for k in sql_keywords}:
+            score = max(score, 1.0)
         for column_index, column_name in column_names:
-            if column_index == table_index and column_name.lower() in question_lower:
-                relevant_table_indices.add(table_index)
-                break
+            if column_index == table_index:
+                col_score = compute_lexical_score(question_norm, column_name)
+                if column_name.lower() in question_norm:
+                    col_score = max(col_score, 1.0)
+                if column_name.lower() in {normalize_schema_text(k) for k in sql_keywords}:
+                    col_score = max(col_score, 1.0)
+                column_scores[(table_index, column_index)] = max(column_scores.get((table_index, column_index), 0.0), col_score)
+        table_scores[table_index] = score
+
+    # Nếu entity hiện diện trong SQL reference hoặc câu hỏi, tăng điểm dựa trên token overlap cho bảng
+    for table_index, table_name in enumerate(table_names):
+        table_expanded = expand_schema_tokens(tokenise_schema_name(table_name))
+        if table_expanded & question_tokens:
+            table_scores[table_index] = max(table_scores.get(table_index, 0.0), 1.0)
+        if reference_sql and any(token in normalize_schema_text(reference_sql) for token in tokenise_schema_name(table_name)):
+            table_scores[table_index] = max(table_scores.get(table_index, 0.0), 0.8)
+
+    # Semantic rerank nếu có model embedding và được bật
+    if use_semantic_rerank:
+        if semantic_model is None:
+            semantic_model = get_semantic_similarity_model()
+        if semantic_model is not None:
+            question_text = question.strip()
+            for table_index, table_name in enumerate(table_names):
+                table_sem = semantic_similarity(question_text, table_name, semantic_model)
+                table_scores[table_index] = max(table_scores.get(table_index, 0.0), table_sem)
+                for column_index, column_name in column_names:
+                    if column_index == table_index:
+                        col_sem = semantic_similarity(question_text, column_name, semantic_model)
+                        column_scores[(table_index, column_index)] = max(
+                            column_scores.get((table_index, column_index), 0.0),
+                            col_sem,
+                        )
+
+    relevant_table_indices: set = {
+        table_index for table_index, score in table_scores.items() if score > 0.0
+    }
 
     if not relevant_table_indices:
         relevant_table_indices = set(range(len(table_names)))
 
-    if max_tables and len(relevant_table_indices) > max_tables:
-        relevant_table_indices = set(list(relevant_table_indices)[:max_tables])
+    # Chọn cột quan trọng nhất cho mỗi bảng đã chọn
+    selected_table_indices = list(sorted(relevant_table_indices))
+    if max_tables and len(selected_table_indices) > max_tables:
+        selected_table_indices = sorted(
+            selected_table_indices,
+            key=lambda idx: table_scores.get(idx, 0.0),
+            reverse=True,
+        )[:max_tables]
 
     statements: List[str] = []
-    for table_index in sorted(relevant_table_indices):
+    for table_index in selected_table_indices:
         table_name = table_names[table_index]
-        table_columns = [
-            (column_index, column_name)
-            for column_index, column_name in column_names
-            if column_index == table_index
-        ]
+        table_columns = []
+        for column_index, column_name in column_names:
+            if column_index != table_index:
+                continue
+            column_score = column_scores.get((table_index, column_index), 0.0)
+            if column_score > 0.0 or column_name.lower() in question_norm:
+                table_columns.append((column_index, column_name))
+        if not table_columns:
+            # giữ ít nhất 1 cột đầu của bảng để không rỗng schema
+            for column_index, column_name in column_names:
+                if column_index == table_index:
+                    table_columns.append((column_index, column_name))
+                    break
         offset = sum(
             1 for column_index, _ in column_names if column_index < table_index
         )
@@ -370,53 +524,6 @@ def build_text2sql_prompt(
     ])
 
     return "\n".join(prompt_parts)
-
-
-def tokenize_question_for_bm25(question: str) -> List[str]:
-    """Tokenize câu hỏi tiếng Việt đơn giản cho BM25 (tách theo khoảng trắng)."""
-    return question.lower().split()
-
-
-def select_few_shot_examples_bm25(
-    target_question: str,
-    candidate_pool: List[Dict[str, Any]],
-    num_examples: int = 3,
-    same_database_only: bool = True,
-    target_db_id: Optional[str] = None,
-) -> List[Dict[str, str]]:
-    """
-    Chọn ví dụ few-shot bằng BM25 (câu hỏi tương đồng nhất).
-
-    Args:
-        target_question: Câu hỏi cần dự đoán
-        candidate_pool: Tập ứng viên (thường là train set)
-        num_examples: Số ví dụ cần lấy
-        same_database_only: Chỉ lấy ví dụ cùng database
-        target_db_id: db_id của câu hỏi mục tiêu
-    """
-    filtered = candidate_pool
-    if same_database_only and target_db_id:
-        filtered = [item for item in candidate_pool if item.get("db_id") == target_db_id]
-
-    if not filtered:
-        filtered = candidate_pool
-
-    corpus = [tokenize_question_for_bm25(item["question"]) for item in filtered]
-    bm25 = BM25Okapi(corpus)
-    scores = bm25.get_scores(tokenize_question_for_bm25(target_question))
-
-    ranked_indices = sorted(range(len(scores)), key=lambda index: scores[index], reverse=True)
-
-    examples: List[Dict[str, str]] = []
-    for index in ranked_indices:
-        item = filtered[index]
-        if item["question"].strip() == target_question.strip():
-            continue
-        examples.append({"question": item["question"], "sql": item["query"]})
-        if len(examples) >= num_examples:
-            break
-
-    return examples
 
 
 def select_few_shot_examples_random(

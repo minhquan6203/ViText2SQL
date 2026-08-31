@@ -19,8 +19,8 @@ unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
 sqlparse>=0.5.0
 nltk>=3.8.1
 
-# Few-shot retrieval bằng BM25
-rank-bm25>=0.2.2
+# Schema linking nâng cao (semantic reranking)
+sentence-transformers>=3.2.1
 
 # API LLM (DeepSeek, Gemini) — dùng trong notebook
 openai>=1.40.0

@@ -19,14 +19,40 @@ from tqdm import tqdm
 
 from src.inference import Text2SQLInferenceEngine
 from src.utils import (
+    build_full_schema_text,
     build_tables_index,
     build_text2sql_prompt,
     ensure_output_dir,
+    get_semantic_similarity_model,
     load_vitext2sql_data,
     resolve_model_config,
     save_json,
     schema_linking,
 )
+
+
+def build_schema_text_for_training(
+    table_entry: Dict[str, Any],
+    question: str,
+    gold_sql: str,
+    use_schema_linking: bool = True,
+    use_semantic_rerank: bool = False,
+    max_tables: int = 3,
+    semantic_model: Any = None,
+) -> str:
+    """Tạo schema text cho sample train, hỗ trợ bật/tắt schema linking + embedding."""
+    if not use_schema_linking:
+        return build_full_schema_text(table_entry)
+    if semantic_model is None and use_semantic_rerank:
+        semantic_model = get_semantic_similarity_model()
+    return schema_linking(
+        table_entry=table_entry,
+        question=question,
+        reference_sql=gold_sql,
+        max_tables=max_tables,
+        use_semantic_rerank=use_semantic_rerank,
+        semantic_model=semantic_model,
+    )
 
 
 # Cấu hình QLoRA theo yêu cầu
@@ -43,6 +69,9 @@ def build_training_dataset(
     train_data: List[Dict[str, Any]],
     tables_index: Dict[str, Dict[str, Any]],
     max_samples: Optional[int] = None,
+    use_schema_linking: bool = True,
+    use_semantic_rerank: bool = False,
+    max_tables: int = 3,
 ) -> Dataset:
     """
     Chuyển train.json thành dataset huấn luyện instruction-following.
@@ -54,6 +83,7 @@ def build_training_dataset(
     records: List[Dict[str, str]] = []
 
     data_subset = train_data[:max_samples] if max_samples else train_data
+    semantic_model = get_semantic_similarity_model() if use_semantic_rerank else None
 
     for item in data_subset:
         db_id = item["db_id"]
@@ -61,7 +91,15 @@ def build_training_dataset(
         gold_sql = item["query"]
         table_entry = tables_index[db_id]
 
-        schema_text = schema_linking(table_entry, question, reference_sql=gold_sql)
+        schema_text = build_schema_text_for_training(
+            table_entry=table_entry,
+            question=question,
+            gold_sql=gold_sql,
+            use_schema_linking=use_schema_linking,
+            use_semantic_rerank=use_semantic_rerank,
+            max_tables=max_tables,
+            semantic_model=semantic_model,
+        )
         prompt = build_text2sql_prompt(question=question, schema_content=schema_text)
 
         records.append({
@@ -112,6 +150,9 @@ def train_qlora(
     max_train_samples: Optional[int] = None,
     eval_after_train: bool = True,
     eval_split: str = "dev",
+    use_schema_linking: bool = True,
+    use_semantic_rerank: bool = False,
+    max_tables: int = 3,
 ) -> Path:
     """
     Huấn luyện QLoRA với Unsloth và lưu checkpoint.
@@ -155,7 +196,12 @@ def train_qlora(
 
     print("[3/5] Chuẩn bị dataset huấn luyện...")
     raw_dataset = build_training_dataset(
-        train_data, tables_index, max_samples=max_train_samples
+        train_data,
+        tables_index,
+        max_samples=max_train_samples,
+        use_schema_linking=use_schema_linking,
+        use_semantic_rerank=use_semantic_rerank,
+        max_tables=max_tables,
     )
     formatted_dataset = raw_dataset.map(
         lambda example: format_training_text(example, tokenizer),
@@ -217,6 +263,9 @@ def train_qlora(
             output_dir=output_dir,
             eval_split=eval_split,
             data_dir=data_dir,
+            use_schema_linking=use_schema_linking,
+            use_semantic_rerank=use_semantic_rerank,
+            max_tables=max_tables,
         )
     else:
         print("[5/5] Bỏ qua đánh giá sau train.")
@@ -233,6 +282,9 @@ def generate_post_train_predictions(
     eval_split: str,
     data_dir: Path,
     max_samples: Optional[int] = None,
+    use_schema_linking: bool = True,
+    use_semantic_rerank: bool = False,
+    max_tables: int = 3,
 ) -> Path:
     """
     Sinh file prediction.json sau fine-tune.
@@ -272,6 +324,7 @@ def generate_post_train_predictions(
     engine.model_config = model_config
 
     predictions: List[Dict[str, Any]] = []
+    semantic_model = get_semantic_similarity_model() if use_semantic_rerank else None
 
     for item in tqdm(eval_data, desc="Suy luận sau fine-tune"):
         db_id = item["db_id"]
@@ -279,7 +332,15 @@ def generate_post_train_predictions(
         gold_sql = item["query"]
         table_entry = tables_index[db_id]
 
-        schema_text = schema_linking(table_entry, question, reference_sql=gold_sql)
+        schema_text = build_schema_text_for_training(
+            table_entry=table_entry,
+            question=question,
+            gold_sql=gold_sql,
+            use_schema_linking=use_schema_linking,
+            use_semantic_rerank=use_semantic_rerank,
+            max_tables=max_tables,
+            semantic_model=semantic_model,
+        )
         prompt = build_text2sql_prompt(question=question, schema_content=schema_text)
         predicted_sql = engine.generate_sql(prompt)
 
@@ -319,6 +380,22 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--no_eval_after_train", action="store_true")
     parser.add_argument("--eval_split", type=str, default="dev", choices=["dev", "test"])
+    parser.add_argument(
+        "--no_schema_linking",
+        action="store_true",
+        help="Tắt schema linking khi train, dùng schema đầy đủ toàn bộ bảng/cột",
+    )
+    parser.add_argument(
+        "--use_semantic_rerank",
+        action="store_true",
+        help="Bật rerank ngữ nghĩa bằng embedding trong schema linking khi train",
+    )
+    parser.add_argument(
+        "--max_tables",
+        type=int,
+        default=3,
+        help="Số bảng tối đa giữ lại trong prompt khi train",
+    )
     return parser.parse_args()
 
 
@@ -338,6 +415,9 @@ def main() -> None:
         max_train_samples=args.max_train_samples,
         eval_after_train=not args.no_eval_after_train,
         eval_split=args.eval_split,
+        use_schema_linking=not args.no_schema_linking,
+        use_semantic_rerank=args.use_semantic_rerank,
+        max_tables=args.max_tables,
     )
 
 

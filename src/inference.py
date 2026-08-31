@@ -3,8 +3,8 @@ Suy luận Zero-shot và Few-shot cho Text-to-SQL trên ViText2SQL.
 
 Hỗ trợ:
 - Zero-shot: không có ví dụ
-- Few-shot: ví dụ ngẫu nhiên hoặc BM25
-- Backend: HuggingFace Transformers (mặc định) hoặc vLLM (tùy chọn)
+- Few-shot: ví dụ ngẫu nhiên
+- Backend: HuggingFace Transformers (mặc định)
 """
 
 from __future__ import annotations
@@ -19,17 +19,42 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from src.utils import (
+    build_full_schema_text,
     build_tables_index,
     build_text2sql_prompt,
     ensure_output_dir,
+    get_semantic_similarity_model,
     load_eval_split,
     normalize_predicted_sql,
     resolve_model_config,
     save_json,
     schema_linking,
-    select_few_shot_examples_bm25,
     select_few_shot_examples_random,
 )
+
+
+def build_schema_text_for_inference(
+    table_entry: Dict[str, Any],
+    question: str,
+    reference_sql: Optional[str] = None,
+    use_schema_linking: bool = True,
+    use_semantic_rerank: bool = False,
+    max_tables: int = 3,
+    semantic_model: Any = None,
+) -> str:
+    """Tạo schema text cho prompt, hỗ trợ bật/tắt schema linking và embedding."""
+    if not use_schema_linking:
+        return build_full_schema_text(table_entry)
+    if semantic_model is None and use_semantic_rerank:
+        semantic_model = get_semantic_similarity_model()
+    return schema_linking(
+        table_entry=table_entry,
+        question=question,
+        reference_sql=reference_sql,
+        max_tables=max_tables,
+        use_semantic_rerank=use_semantic_rerank,
+        semantic_model=semantic_model,
+    )
 
 
 class Text2SQLInferenceEngine:
@@ -227,12 +252,15 @@ def run_inference(
     output_path: Path,
     data_dir: Path,
     num_shots: int = 3,
-    example_strategy: str = "bm25",
+    example_strategy: str = "random",
     max_samples: Optional[int] = None,
     load_in_4bit: bool = True,
     use_unsloth: bool = False,
     seed: int = 42,
     batch_size: int = 1,
+    use_schema_linking: bool = True,
+    use_semantic_rerank: bool = False,
+    max_tables: int = 3,
 ) -> List[Dict[str, Any]]:
     """
     Chạy suy luận trên tập dev hoặc test.
@@ -244,11 +272,12 @@ def run_inference(
         output_path: Đường dẫn lưu prediction.json
         data_dir: Thư mục dữ liệu
         num_shots: Số ví dụ few-shot
-        example_strategy: 'bm25' hoặc 'random'
+        example_strategy: 'random'
         max_samples: Giới hạn số mẫu (debug)
     """
     eval_data, train_data, tables_data = load_eval_split(data_dir, split=split)
     tables_index = build_tables_index(tables_data)
+    semantic_model = get_semantic_similarity_model() if use_semantic_rerank else None
 
     if max_samples:
         eval_data = eval_data[:max_samples]
@@ -276,27 +305,23 @@ def run_inference(
 
             few_shot_examples = None
             if mode == "few_shot":
-                if example_strategy == "bm25":
-                    few_shot_examples = select_few_shot_examples_bm25(
-                        target_question=question,
-                        candidate_pool=train_data,
-                        num_examples=num_shots,
-                        target_db_id=db_id,
-                    )
-                else:
-                    few_shot_examples = select_few_shot_examples_random(
-                        candidate_pool=train_data,
-                        num_examples=num_shots,
-                        target_db_id=db_id,
-                        exclude_question=question,
-                        seed=seed,
-                    )
+                few_shot_examples = select_few_shot_examples_random(
+                    candidate_pool=train_data,
+                    num_examples=num_shots,
+                    target_db_id=db_id,
+                    exclude_question=question,
+                    seed=seed,
+                )
 
             reference_sql = few_shot_examples[0]["sql"] if few_shot_examples else None
-            schema_text = schema_linking(
+            schema_text = build_schema_text_for_inference(
                 table_entry=table_entry,
                 question=question,
                 reference_sql=reference_sql,
+                use_schema_linking=use_schema_linking,
+                use_semantic_rerank=use_semantic_rerank,
+                max_tables=max_tables,
+                semantic_model=semantic_model,
             )
 
             prompt = build_text2sql_prompt(
@@ -381,9 +406,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--example_strategy",
         type=str,
-        default="bm25",
-        choices=["bm25", "random"],
-        help="Chiến lược chọn ví dụ few-shot",
+        default="random",
+        choices=["random"],
+        help="Chiến lược chọn ví dụ few-shot (chỉ hỗ trợ random)",
     )
     parser.add_argument(
         "--max_samples",
@@ -407,6 +432,22 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Dùng Unsloth FastLanguageModel cho suy luận",
     )
+    parser.add_argument(
+        "--no_schema_linking",
+        action="store_true",
+        help="Tắt schema linking và dùng schema đầy đủ toàn bộ bảng/cột",
+    )
+    parser.add_argument(
+        "--use_semantic_rerank",
+        action="store_true",
+        help="Bật rerank ngữ nghĩa bằng embedding model cho schema linking",
+    )
+    parser.add_argument(
+        "--max_tables",
+        type=int,
+        default=3,
+        help="Số bảng tối đa giữ lại trong prompt sau schema linking",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -429,6 +470,9 @@ def main() -> None:
         use_unsloth=args.use_unsloth,
         seed=args.seed,
         batch_size=args.batch_size,
+        use_schema_linking=not args.no_schema_linking,
+        use_semantic_rerank=args.use_semantic_rerank,
+        max_tables=args.max_tables,
     )
 
 

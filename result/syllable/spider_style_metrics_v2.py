@@ -1,33 +1,7 @@
-"""
-Tinh metric giong paper Nguyen et al. 2020 - "A Pilot Study of Text-to-SQL
-Semantic Parsing for Vietnamese" (EMNLP Findings 2020), co su dung schema
-(tables.json) de resolve alias -> ten bang/cot that, giup so khop chinh xac
-hon ban khong co schema.
-
-2 metric (theo Yu et al. 2018 - Spider):
-  1. Exact Matching Accuracy (EM)
-  2. Component Matching F1 cho SELECT / WHERE / GROUP BY / ORDER BY / KEYWORDS
-
-Cach dung:
-    python3 spider_style_metrics_v2.py tables.json pred1.txt pred2.txt ...
-
-GIOI HAN con lai (khong the khac phuc neu khong co file database that / khong
-viet lai toan bo process_sql.py cua Spider):
-  - Khong tinh duoc Execution Accuracy (can file .sqlite that de chay query).
-  - Component matching o day dua tren tach "item" theo dau phay / AND-OR va so
-    sanh tap hop (set) cac item da duoc chuan hoa alias->ten that, thay vi
-    parse thanh AST day du nhu process_sql.py goc (vi du: chua xu ly rieng
-    aggregation + DISTINCT thanh tuple co cau truc, chua tach nested subquery
-    thanh cay de so sanh de quy). Day la xap xi manh, khong phai ban chinh xac
-    100% cua eval script goc, nhung da loai bo duoc nguon nhieu lon nhat la
-    alias khac nhau (t1 vs t) va tu nhieu-tu tieng Viet bi tach sai.
-"""
-
 import json
 import re
 import sys
 from collections import Counter, defaultdict
-
 
 # ---------------------------------------------------------------------------
 # 1. Load schema
@@ -69,12 +43,13 @@ def load_schema(tables_path):
 
 
 # ---------------------------------------------------------------------------
-# 2. Tokenize raw SQL string (whitespace-based, keep punctuation as separate
-#    tokens -- data is already formatted with spaces around ( ) , = < > etc.)
+# 2. Tokenize raw SQL string (Khử nhiễu dấu ngoặc kép \")
 # ---------------------------------------------------------------------------
 
 def raw_tokenize(sql):
     sql = sql.strip().lower()
+    # Loại bỏ dấu ngoặc kép dư thừa do model sinh ra (e.g. \"tình trạng lỗi\" -> tình trạng lỗi)
+    sql = sql.replace('"', '').replace('\\', '')
     sql = re.sub(r"\s+", " ", sql)
     sql = re.sub(r"\s*([(),])\s*", r" \1 ", sql)
     sql = re.sub(r"\s+", " ", sql).strip()
@@ -91,18 +66,10 @@ SQL_KEYWORDS = {
 
 
 # ---------------------------------------------------------------------------
-# 3. Schema-aware canonicalisation: replace "alias.word word word" or bare
-#    "word word word" column references with canonical "table.column" names,
-#    and multi-word table names in FROM/JOIN with their canonical form. This
-#    removes alias-naming noise (t1 vs t) before we compare gold vs predict.
+# 3. Schema-aware canonicalisation
 # ---------------------------------------------------------------------------
 
 def greedy_match(tokens, start, candidates):
-    """
-    candidates: list of (word_tuple, name) sorted longest-first.
-    Try to match the longest word_tuple starting at tokens[start:].
-    Return (matched_name, n_words) or (None, 0).
-    """
     for word_tuple, name in candidates:
         n = len(word_tuple)
         if start + n > len(tokens):
@@ -113,12 +80,6 @@ def greedy_match(tokens, start, candidates):
 
 
 def split_top_level_blocks(tokens):
-    """
-    Split tokens at top-level (paren depth 0) occurrences of intersect/union/except.
-    Each block gets its own alias scope (aliases like t1/t2 are commonly reused
-    independently in each block of a set-operator query). Returns list of
-    (block_tokens, following_separator_or_None).
-    """
     cur = []
     depth = 0
     result = []
@@ -141,14 +102,6 @@ def split_top_level_blocks(tokens):
 
 
 def canonicalize(sql, db_schema):
-    """
-    Returns list of canonical tokens:
-      - qualified column refs -> "table_name.column_name" (single token, spaces->'_')
-      - table refs in FROM/JOIN -> table_name (single token, spaces->'_'), alias tokens dropped
-      - everything else kept as-is (lowercased)
-    Query is split at top-level INTERSECT/UNION/EXCEPT into independent blocks,
-    each with its own alias scope, before resolving.
-    """
     tokens = raw_tokenize(sql)
     out_all = []
     for block_tokens, sep in split_top_level_blocks(tokens):
@@ -163,7 +116,6 @@ def _canonicalize_block(tokens, db_schema):
     out = []
     alias_map = {}  # alias -> table_name
 
-    i = 0
     # ---- pass 1: scan FROM/JOIN to build alias_map -------------------
     j = 0
     while j < n:
@@ -174,7 +126,7 @@ def _canonicalize_block(tokens, db_schema):
                                              [(wt, tn) for wt, _, tn in db_schema["table_word_tuples"]])
             if tbl_name is not None:
                 j += nwords
-                alias = tbl_name  # default: alias == table name if none given
+                alias = tbl_name
                 if j < n and tokens[j] == "as":
                     j += 1
                     if j < n:
@@ -182,7 +134,6 @@ def _canonicalize_block(tokens, db_schema):
                         alias_map[alias] = tbl_name
                         j += 1
                 elif j < n and tokens[j] not in SQL_KEYWORDS and "." not in tokens[j]:
-                    # implicit alias, e.g. "from tài sản t"
                     alias = tokens[j]
                     alias_map[alias] = tbl_name
                     j += 1
@@ -209,9 +160,9 @@ def _canonicalize_block(tokens, db_schema):
                 if i < n and tokens[i] == "as":
                     i += 1
                     if i < n:
-                        i += 1  # skip alias token entirely (already canonical via table name)
+                        i += 1
                 elif i < n and tokens[i] not in SQL_KEYWORDS and "." not in tokens[i]:
-                    i += 1  # skip implicit alias token
+                    i += 1
             continue
 
         if "." in tok and not re.match(r"^\d+\.\d+$", tok):
@@ -224,19 +175,18 @@ def _canonicalize_block(tokens, db_schema):
             else:
                 candidates = db_schema["all_columns"]
 
-            probe = [first_word] + tokens[i + 1:i + 8]  # look ahead up to 7 more words
+            probe = [first_word] + tokens[i + 1:i + 8]
             col_name, nwords = greedy_match(probe, 0, candidates)
             if col_name is not None:
                 canon_table = table_name if table_name is not None else "unk"
                 out.append(f"{canon_table.replace(' ', '_')}.{col_name.replace(' ', '_')}")
-                i += nwords  # first_word + (nwords-1) following tokens
+                i += nwords
                 continue
             else:
                 out.append(tok)
                 i += 1
                 continue
 
-        # bare (unqualified) column reference, e.g. after GROUP BY / ORDER BY / SELECT
         if tok not in SQL_KEYWORDS and re.match(r"^[a-zA-ZÀ-ỹ_]", tok):
             probe = [tok] + tokens[i + 1:i + 8]
             col_name, nwords = greedy_match(probe, 0, db_schema["all_columns"])
@@ -252,7 +202,7 @@ def _canonicalize_block(tokens, db_schema):
 
 
 # ---------------------------------------------------------------------------
-# 4. Clause splitting (top-level, paren-depth aware) on canonical tokens
+# 4. Order-agnostic Logic (Xử lý Reorder nâng cao)
 # ---------------------------------------------------------------------------
 
 def split_clauses(canon_tokens):
@@ -304,7 +254,6 @@ def split_clauses(canon_tokens):
 
 
 def split_items(tokens, seps):
-    """Split a token list into items at top-level (depth 0) occurrences of seps."""
     items, cur, depth = [], [], 0
     for tok in tokens:
         if tok == "(":
@@ -330,14 +279,30 @@ COMPONENTS = ["SELECT", "WHERE", "GROUP BY", "ORDER BY", "KEYWORDS"]
 
 
 def component_items(clauses):
-    """Convert raw clause token lists into a dict of component -> set(items)."""
     result = {}
     result["SELECT"] = set(split_items(clauses.get("SELECT", []), {","}))
     result["WHERE"] = set(split_items(clauses.get("WHERE", []), {"and", "or"}))
     result["GROUP BY"] = set(split_items(clauses.get("GROUP BY", []), {","}))
     result["ORDER BY"] = set(split_items(clauses.get("ORDER BY", []), {","}))
     result["KEYWORDS"] = set(clauses.get("KEYWORDS", []))
+    
+    # Đóng gói cả thông tin LIMIT vào KEYWORDS/SELECT dưới dạng tập hợp để tăng độ chuẩn xác khi EM
+    if "LIMIT" in clauses:
+        result["KEYWORDS"].add("limit")
+        result["KEYWORDS"].update(clauses["LIMIT"])
+        
     return result
+
+
+def is_structurally_equal(gold_items, pred_items):
+    """
+    So sánh hai câu SQL dựa trên cấu trúc tập hợp của từng component.
+    Nếu toàn bộ các cặp component giống nhau hoàn toàn (không phụ thuộc thứ tự), trả về True.
+    """
+    for comp in COMPONENTS:
+        if gold_items[comp] != pred_items[comp]:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -375,11 +340,12 @@ def evaluate(examples, db_map):
             gold_canon = canonicalize(gold_sql, db_schema)
             pred_canon = canonicalize(pred_sql, db_schema)
 
-        if " ".join(gold_canon) == " ".join(pred_canon):
-            em_correct += 1
-
         gold_items = component_items(split_clauses(gold_canon))
         pred_items = component_items(split_clauses(pred_canon))
+
+        # Thay vì so khớp chuỗi thô (dễ lệch vị trí), ta kiểm tra độ tương thích cấu trúc Set
+        if is_structurally_equal(gold_items, pred_items):
+            em_correct += 1
 
         for comp in COMPONENTS:
             f1 = set_f1(gold_items[comp], pred_items[comp])

@@ -7,7 +7,7 @@ Hỗ trợ đầy đủ ba hướng tiếp cận:
 | Phương pháp | Mô tả |
 |-------------|--------|
 | **Zero-shot** | Schema + câu hỏi, không có ví dụ |
-| **Few-shot** | Thêm ví dụ từ train set (BM25 hoặc random) |
+| **Few-shot** | Thêm ví dụ ngẫu nhiên từ train set |
 | **Fine-tune (QLoRA)** | Huấn luyện adapter LoRA với Unsloth trên GPU cấu hình thấp |
 
 Đánh giá theo **Exact Match (EM)** và **Component F1** kế thừa từ [Spider Benchmark](https://github.com/taoyds/spider) — so khớp cấu trúc AST SQL, không phải so sánh chuỗi.
@@ -20,12 +20,60 @@ Hỗ trợ đầy đủ ba hướng tiếp cận:
 - [Yêu cầu hệ thống](#yêu-cầu-hệ-thống)
 - [Cài đặt](#cài-đặt)
 - [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
-- [Chạy pipeline tự động](#chạy-pipeline-tự-động)
-- [Hướng dẫn từng module](#hướng-dẫn-từng-module)
-- [Notebook API (DeepSeek, Gemini)](#notebook-api-deepseek-gemini)
-- [Mô hình hỗ trợ](#mô-hình-hỗ-trợ)
+- [Train](#train)
+- [Infer](#infer)
+- [Eval](#eval)
+- [Schema linking / embedding](#schema-linking--embedding)
 - [Đánh giá (EM & F1)](#đánh-giá-em--f1)
 - [Trích dẫn](#trích-dẫn)
+
+---
+
+## Kiến trúc pipeline Text-to-SQL với schema linking
+
+```mermaid
+flowchart TD
+    A[Câu hỏi tiếng Việt] --> B[Load schema từ tables.json]
+    B --> C[Schema linking]
+    C --> D[Chọn bảng/cột quan trọng]
+    D --> E[Build prompt]
+    E --> F{Chế độ suy luận}
+    F -->|Zero-shot| G[Prompt chỉ có schema]
+    F -->|Few-shot| H[Prompt + ví dụ ngẫu nhiên]
+    G --> I[LLM sinh SQL]
+    H --> I
+    I --> J[Chuẩn hóa SQL]
+    J --> K[Đánh giá EM/F1]
+
+    L[Train set + gold SQL] --> M[Schema-aware training samples]
+    M --> N[QLoRA fine-tune]
+    N --> O[Checkpoint]
+    O --> P[Inference sau fine-tune]
+    P --> J
+```
+
+### Luồng hoạt động
+
+1. Đọc schema cơ sở dữ liệu từ `tables.json` cho từng `db_id`.
+2. Chạy schema linking để giữ chỉ các bảng và cột có khả năng liên quan đến câu hỏi.
+3. Tạo prompt Text-to-SQL theo format:
+   - `[Schema]`
+   - `[Ví dụ]` (nếu là few-shot)
+   - `[Bài tập]`
+   - `Câu hỏi: ...`
+   - `SQL:`
+4. Gửi prompt cho LLM để sinh SQL.
+5. Chuẩn hóa output SQL, sau đó đánh giá bằng Exact Match (EM) và Component F1.
+6. Với fine-tuning, các sample train cũng được sinh theo cùng logic schema linking để mô hình học hiệu quả hơn.
+
+### Tại sao schema linking quan trọng?
+
+- Giảm nhiễu khi schema lớn.
+- Tăng khả năng mô hình chọn đúng bảng/cột.
+- Giảm lỗi khi câu hỏi tiếng Việt không khớp trực tiếp với tên cột trong DB.
+- Rất hiệu quả cho các bài toán Text-to-SQL có nhiều bảng và join phức tạp.
+
+Trong repo này, logic schema linking đã được triển khai trong `src/utils.py` và được dùng trong cả inference lẫn fine-tune.
 
 ---
 
@@ -34,27 +82,25 @@ Hỗ trợ đầy đủ ba hướng tiếp cận:
 ```
 ViText2SQL/
 ├── data/
-│   ├── word-level/              # Bản tách từ (RDRSegmenter)
+│   ├── word-level/
 │   │   ├── train.json
 │   │   ├── dev.json
-│   │   ├── test.json            # Câu hỏi test
-│   │   ├── test_gold.sql        # SQL gốc test (đánh giá chính thức)
+│   │   ├── test.json
+│   │   ├── test_gold.sql
 │   │   └── tables.json
-│   ├── syllable-level/          # Bản gốc mức âm tiết
-│   └── database/                # SQLite DBs (tùy chọn, cho execution eval)
-│       └── {db_id}/{db_id}.sqlite
-├── notebooks/
-│   └── api_zero_few_shot.ipynb  # Zero/Few-shot qua API (DeepSeek, Gemini)
-├── outputs/                     # Predictions, metrics, checkpoints
+│   ├── syllable-level/
+│   └── database/
+├── outputs/
 ├── src/
-│   ├── utils.py                 # Tải dữ liệu, schema linking, prompt
-│   ├── inference.py             # Zero-shot / Few-shot (local LLM)
-│   ├── train.py                 # Fine-tune QLoRA (Unsloth)
-│   ├── evaluate.py              # EM & Component F1
-│   ├── api_clients.py           # Client DeepSeek, Gemini
-│   └── spider_eval/             # Parser & logic đánh giá Spider
+│   ├── utils.py
+│   ├── inference.py
+│   ├── train.py
+│   ├── evaluate.py
+│   └── spider_eval/
 ├── requirements.txt
-└── run_pipeline.sh              # Script chạy toàn bộ luồng
+├── README.md
+├── run_pipeline.sh
+└── notebooks/
 ```
 
 ---
@@ -129,78 +175,9 @@ Cần cho **Execution Accuracy**; EM/F1 structural matching chỉ cần `tables.
 
 ---
 
-## Chạy pipeline tự động
+## Train
 
-Script `run_pipeline.sh` chạy lần lượt: Zero-shot → Few-shot → Fine-tune → Eval trên **test set**.
-
-```bash
-chmod +x run_pipeline.sh
-
-# Chạy toàn bộ (Qwen 1.5B, word-level, test set)
-./run_pipeline.sh
-
-# Tùy chọn
-./run_pipeline.sh \
-  --model qwen2.5-coder-1.5b \
-  --data_dir data/syllable-level \
-  --split test \
-  --num_shots 3 \
-  --num_epochs 3 \
-  --max_samples 50          # Giới hạn mẫu (debug)
-
-# Chỉ inference + eval, bỏ fine-tune
-./run_pipeline.sh --skip_train
-```
-
-**Windows (Git Bash / WSL):** dùng lệnh trên trong Git Bash hoặc WSL. Trên PowerShell thuần, chạy từng lệnh Python bên dưới.
-
----
-
-## Hướng dẫn từng module
-
-### 1. Inference — Zero-shot / Few-shot (local LLM)
-
-```bash
-# Zero-shot trên test set
-python -m src.inference \
-  --model qwen2.5-coder-1.5b \
-  --mode zero_shot \
-  --split test \
-  --data_dir data/word-level \
-  --output_dir outputs
-
-# Few-shot với BM25 (3 ví dụ từ train set)
-python -m src.inference \
-  --model llama-3.2-3b \
-  --mode few_shot \
-  --example_strategy bm25 \
-  --num_shots 3 \
-  --split test \
-  --use_unsloth
-
-# Few-shot random
-python -m src.inference \
-  --model gemma-2-2b \
-  --mode few_shot \
-  --example_strategy random \
-  --split test
-```
-
-Batch inference mới: thêm `--batch_size` để xử lý nhiều prompt cùng lúc.
-
-```bash
-python -m src.inference \
-  --model qwen2.5-coder-1.5b \
-  --mode zero_shot \
-  --split test \
-  --data_dir data/word-level \
-  --output_dir outputs \
-  --batch_size 4
-```
-
-Kết quả: `outputs/predictions_{model}_{mode}_{split}.json`
-
-### 2. Fine-tune QLoRA (Unsloth)
+Huấn luyện QLoRA cho mô hình.
 
 ```bash
 python -m src.train \
@@ -213,13 +190,321 @@ python -m src.train \
   --eval_split test
 ```
 
-Cấu hình LoRA mặc định: `r=16`, `alpha=32`, target modules Q/K/V/O + MLP.
+Các tùy chọn thường dùng:
 
-Checkpoint: `outputs/checkpoints_{model}_qlora/final/`
+```bash
+python -m src.train \
+  --model qwen2.5-coder-1.5b \
+  --data_dir data/syllable-level \
+  --output_dir outputs \
+  --num_epochs 3 \
+  --batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --max_samples 100
+```
 
-Sau train tự động sinh `predictions_{model}_finetuned_test.json`.
+- Output checkpoint: `outputs/checkpoints_{model}_qlora/final/`
+- Sau khi train xong, bạn có thể dùng checkpoint này cho inference tiếp theo.
 
-### 3. Đánh giá EM & F1
+### CLI bật/tắt schema linking và embedding khi train
+
+Mặc định train đang bật schema linking, còn semantic rerank thì tắt.
+
+```bash
+# Mặc định: schema linking ON, semantic rerank OFF
+python -m src.train \
+  --model qwen2.5-coder-1.5b \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --num_epochs 3 \
+  --batch_size 2 \
+  --gradient_accumulation_steps 8
+
+# Tắt schema linking hoàn toàn
+python -m src.train \
+  --model qwen2.5-coder-1.5b \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --num_epochs 3 \
+  --batch_size 2 \
+  --gradient_accumulation_steps 8 \
+  --no_schema_linking
+
+# Bật semantic rerank bằng embedding
+python -m src.train \
+  --model qwen2.5-coder-1.5b \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --num_epochs 3 \
+  --batch_size 2 \
+  --gradient_accumulation_steps 8 \
+  --use_semantic_rerank \
+  --max_tables 3
+```
+
+- `--no_schema_linking`: bỏ schema linking, dùng schema đầy đủ cho toàn bộ bảng/cột
+- `--use_semantic_rerank`: bật embedding rerank trong schema linking
+- `--max_tables`: giới hạn số bảng giữ lại trong prompt
+
+> Nếu dùng `--no_schema_linking`, thì `--use_semantic_rerank` không còn hiệu lực vì toàn bộ schema đã được giữ nguyên.
+
+---
+
+## Infer
+
+### 1) Zero-shot
+
+```bash
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode zero_shot \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs
+```
+
+### 2) Few-shot
+
+```bash
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode few_shot \
+  --num_shots 3 \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs
+```
+
+### 3) Few-shot với batch / debug
+
+```bash
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode few_shot \
+  --num_shots 3 \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --batch_size 4 \
+  --max_samples 50
+```
+
+Kết quả lưu vào: `outputs/predictions_{model}_{mode}_{split}.json`
+
+### 4) CLI bật/tắt schema linking và embedding khi infer
+
+Mặc định infer đang bật schema linking, còn semantic rerank thì tắt.
+
+```bash
+# Mặc định: schema linking ON, semantic rerank OFF
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode zero_shot \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs
+
+# Tắt schema linking
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode few_shot \
+  --num_shots 3 \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --no_schema_linking
+
+# Bật embedding semantic rerank
+python -m src.inference \
+  --model qwen2.5-coder-1.5b \
+  --mode zero_shot \
+  --split test \
+  --data_dir data/word-level \
+  --output_dir outputs \
+  --use_semantic_rerank \
+  --max_tables 3
+```
+
+- `--no_schema_linking`: bỏ schema linking
+- `--use_semantic_rerank`: bật rerank bằng embedding trong schema linking
+- `--max_tables`: giới hạn top-k bảng quan trọng
+
+> Mặc định không truyền flag là schema linking ON và semantic rerank OFF. Nếu muốn dùng embedding, hãy thêm `--use_semantic_rerank`.
+
+---
+
+## Eval
+
+Sau khi có file dự đoán, chạy đánh giá EM và F1.
+
+```bash
+python -m src.evaluate \
+  --predictions outputs/predictions_qwen2.5-coder-1.5b_zero_shot_test.json \
+  --tables data/word-level/tables.json \
+  --output_metrics outputs/metrics_zero_shot.json \
+  --verbose
+```
+
+```bash
+python -m src.evaluate \
+  --predictions outputs/predictions_qwen2.5-coder-1.5b_few_shot_test.json \
+  --tables data/word-level/tables.json \
+  --output_metrics outputs/metrics_few_shot.json \
+  --verbose
+```
+
+Các metric chính:
+- Exact Match (EM)
+- Component F1
+
+---
+
+## Schema linking / embedding
+
+Trong project này, schema linking ở [`src/utils.py`](src/utils.py). Mặc định là bật.
+
+- `use_schema_linking=True`: giữ lại các bảng/cột quan trọng, giảm nhiễu
+- `use_semantic_rerank=False`: dùng lexical matching nhanh hơn
+- `use_semantic_rerank=True`: dùng embedding để rerank schema theo similarity
+- `max_tables=3`: chỉ giữ tối đa 3 bảng quan trọng nhất
+
+Ví dụ cơ bản:
+
+```python
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=gold_sql,
+    max_tables=3,
+    use_semantic_rerank=False,
+)
+```
+
+Nếu cần semantic rerank:
+
+```python
+semantic_model = get_semantic_similarity_model()
+
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=gold_sql,
+    max_tables=3,
+    use_semantic_rerank=True,
+    semantic_model=semantic_model,
+)
+```
+
+> Gợi ý thực tế: dùng lexical matching trước; chỉ bật embedding khi muốn cải thiện câu hỏi có nghĩa tương đương nhưng chữ không khớp trực tiếp.
+
+---
+
+## Hướng dẫn từng module
+
+Trong project này, schema linking được thực hiện bằng hàm `schema_linking(...)` trong [`src/utils.py`](src/utils.py), và bạn có thể bật/tắt theo nhu cầu.
+
+#### Cấu hình mặc định
+
+```python
+USE_SCHEMA_LINKING = True
+USE_SEMANTIC_RERANK = False
+MAX_TABLES = 3
+SEMANTIC_MODEL = None
+```
+
+#### Bật semantic rerank (embedding)
+
+```python
+from src.utils import get_semantic_similarity_model, schema_linking
+
+SEMANTIC_MODEL = get_semantic_similarity_model()
+
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=gold_sql,
+    max_tables=MAX_TABLES,
+    use_semantic_rerank=True,
+    semantic_model=SEMANTIC_MODEL,
+)
+```
+
+#### Tắt semantic rerank, chỉ dùng lexical matching
+
+```python
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=gold_sql,
+    max_tables=MAX_TABLES,
+    use_semantic_rerank=False,
+)
+```
+
+#### Tắt schema linking hoàn toàn
+
+```python
+schema_text = build_full_schema_text(table_entry)
+```
+
+- `USE_SCHEMA_LINKING = True`: giữ lại schema quan trọng, giảm nhiễu cho mô hình.
+- `USE_SEMANTIC_RERANK = True`: ưu tiên các bảng/cột có nghĩa gần câu hỏi, dù chữ không khớp trực tiếp.
+- `MAX_TABLES = 3`: chọn tối đa 3 bảng quan trọng nhất. Bạn có thể tăng lên 4–6 nếu schema lớn nhưng cần tránh quá nhiều bảng trong prompt.
+- `SEMANTIC_MODEL = None`: nếu `sentence-transformers` chưa cài hoặc không muốn dùng embedding, code sẽ tự fallback về lexical matching.
+
+#### Dùng trong train
+
+Trong [`src/train.py`](src/train.py), phần chuẩn bị sample huấn luyện hiện đang gọi:
+
+```python
+schema_text = schema_linking(table_entry, question, reference_sql=gold_sql)
+```
+
+Nếu muốn bật embedding ở train, hãy đổi thành:
+
+```python
+semantic_model = get_semantic_similarity_model()
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=gold_sql,
+    max_tables=3,
+    use_semantic_rerank=True,
+    semantic_model=semantic_model,
+)
+```
+
+#### Dùng trong infer
+
+Trong [`src/inference.py`](src/inference.py), phần sinh prompt theo batch đang gọi:
+
+```python
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=reference_sql,
+)
+```
+
+Nếu muốn bật embedding khi suy luận, đổi thành:
+
+```python
+semantic_model = get_semantic_similarity_model()
+schema_text = schema_linking(
+    table_entry=table_entry,
+    question=question,
+    reference_sql=reference_sql,
+    max_tables=3,
+    use_semantic_rerank=True,
+    semantic_model=semantic_model,
+)
+```
+
+> Gợi ý thực tế: nếu bạn đang xử lý dataset lớn và muốn tốc độ nhanh, hãy để `use_semantic_rerank=False`. Nếu muốn tăng độ chính xác cho câu hỏi có nghĩa tương đương nhưng chữ khác, bật `use_semantic_rerank=True`.
+
+---
+
+### 4. Đánh giá EM & F1
 
 > Lưu ý: `src.inference` chỉ tạo file dự đoán, không tính điểm. Để tính Exact Match và Component F1, chạy `src.evaluate`.
 
